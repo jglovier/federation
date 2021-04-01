@@ -6,7 +6,9 @@ orbs:
   # `oss` is a local reference to the package.  The source for Apollo Orbs can
   # be found at http://github.com/apollographql/CircleCI-Orbs/.
   # We could use Renovate to bump this version via PR, but that's not set up now.
-  oss: apollo/oss-ci-cd-tooling@0.0.15
+  oss: apollo/oss-ci-cd-tooling@0.0.16
+  rust: circleci/rust@1.2.0
+  win: circleci/windows@2.3.0
 
 commands:
   # These are the steps used for each version of Node which we're testing
@@ -28,6 +30,19 @@ commands:
           path: reports/junit
       - store_artifacts:
           path: reports/junit
+
+executors:
+  rust_linux: &rust_linux_executor
+    docker:
+      - image: cimg/base:stable
+  rust_macos: &rust_macos_executor
+    macos:
+      xcode: 11.4
+  rust_windows: &rust_windows_executor
+    machine:
+      image: 'windows-server-2019-vs2019:stable'
+    resource_class: windows.medium
+    shell: powershell.exe -ExecutionPolicy Bypass
 
 # Important! When adding a new job to `jobs`, make sure to define when it
 # executes by also adding it to the `workflows` section below!
@@ -64,6 +79,98 @@ jobs:
       - oss/npm_clean_install_with_caching
       - run:
           command: npm run codegen:check
+  Rust:
+    parameters:
+      platform:
+        type: executor
+    executor: << parameters.platform >>
+    environment:
+      # Because it's difficult to change the npm version on Windows,
+      # we just use the version of npm that comes with this version of Node.js
+      # These versions can be found at https://nodejs.org/en/download/releases/.
+      NODE_VERSION: 14.16.1
+    steps:
+      - checkout
+      - when:
+          condition:
+            equal: [ *rust_macos_executor, << parameters.platform >> ]
+          steps:
+            - rust/install:
+                version: stable
+            # - run:
+            #     name: Install nvm
+            #     command: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | bash
+            - run:
+                name: Installing Node.js with a .pkg.
+                command: |
+                  curl "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}.pkg" > "$HOME/Downloads/node.pkg" && sudo installer -store -pkg "$HOME/Downloads/node.pkg" -target "/"
+            - run: node --version
+            - run: npm --version
+            - run: npm install
+            - rust/format:
+                with_cache: false
+            - rust/clippy:
+                with_cache: false
+            - rust/test:
+                with_cache: false
+      - when:
+          condition:
+            equal: [ *rust_linux_executor, << parameters.platform >> ]
+          steps:
+            - rust/install:
+                version: stable
+            # This can be removed after the release of a new version of this Orb
+            - run:
+                name: Special-case shell install for CircleCI (temporary!)
+                command: echo '. ~/.cargo/env' >> $BASH_ENV
+            - run:
+                name: Install nvm
+                command: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | bash
+            - run: echo '. ~/.nvm/nvm.sh' >> $BASH_ENV
+            - run: nvm install $NODE_VERSION && nvm alias default $NODE_VERSION
+            - run: npm install
+            - rust/format:
+                with_cache: false
+            - rust/clippy:
+                with_cache: false
+            - rust/test:
+                with_cache: false
+      - when:
+          condition:
+            equal: [ *rust_windows_executor, << parameters.platform >> ]
+          steps:
+            - run:
+                name: Install rustup
+                command: |
+                  $installer_dir = "$Env:TEMP"
+                  echo "Downloading rustup"
+                  (New-Object System.Net.WebClient).DownloadFile("https://win.rustup.rs", "$installer_dir\rustup-init.exe")
+                  echo "Installing rustup"
+                  & $installer_dir\rustup-init.exe --profile minimal --component rustfmt,clippy -y
+                  echo "Done"
+            - run:
+                name: Special case for Windows because of ssh-agent
+                # git config --global url."https://github.com/".insteadOf "git://github.com"
+                command: |
+                  Add-Content -path "${Env:USERPROFILE}\.cargo\config.toml" @"
+                  [net]
+                  git-fetch-with-cli = true
+                  "@
+            - run:
+                name: Install nvm (with choco)
+                command: choco install nvm
+            - run:
+                name: Install desired Node.js version with nvm
+                command: |
+                  nvm install ${Env:NODE_VERSION}
+                  nvm on
+            - run: npm install
+            - rust/format:
+                with_cache: false
+            - rust/clippy:
+                with_cache: false
+            - rust/test:
+                with_cache: false
 
 # XXX We used to use this filter to only run a "Docs" job on docs branches.
 #     Now we use it to disable all jobs. It's unclear if there's a simpler way
@@ -100,12 +207,20 @@ workflows:
       - GraphQL Types:
           name: "GraphQL Types (up to date)"
           <<: *common_non_publish_filters
+      - Rust:
+          matrix:
+            parameters:
+              platform:
+                - rust_macos
+                - rust_windows
+                - rust_linux
       - oss/lerna_tarballs:
           name: "JS: Package tarballs"
           <<: *common_non_publish_filters
           requires:
             - "JS: Node 12"
             - "JS: Node 14"
+            - Rust
             - "GraphQL Types (up to date)"
       - oss/dry_run:
           name: "JS: Dry-run"
@@ -113,6 +228,7 @@ workflows:
           requires:
             - "JS: Node 12"
             - "JS: Node 14"
+            - Rust
             - "GraphQL Types (up to date)"
       - oss/confirmation:
           name: "JS: Confirmation"
